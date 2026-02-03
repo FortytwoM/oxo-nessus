@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.coverage
+htmlcov
+.tox
+.nox
+
+# Virtual environments
+.venv
+venv
+env
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Tests
+tests/
+
+# Documentation
+*.md
+!README.md
+images/
+
+# Development files
+.env
+.env.example
+agent-group.yaml
+test_agent.py
+requirements-dev.txt
+
+# GitHub
+.github/

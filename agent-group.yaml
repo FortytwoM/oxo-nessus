@@ -1,0 +1,33 @@
+kind: AgentGroup
+description: Nessus vulnerability scanner agent group
+
+agents:
+  - key: agent/FortyTwoM/nessus
+    args:
+      - name: nessus_url
+        type: string
+        value: "https://your-nessus-server:8834"
+      - name: access_key
+        type: string
+        value: "YOUR_ACCESS_KEY"
+      - name: secret_key
+        type: string
+        value: "YOUR_SECRET_KEY"
+      - name: verify_ssl
+        type: boolean
+        value: false
+      - name: scan_policy_id
+        type: number
+        value: 0
+      - name: scan_template
+        type: string
+        value: "basic"
+      - name: wait_for_completion
+        type: boolean
+        value: true
+      - name: timeout
+        type: number
+        value: 3600
+      - name: min_severity
+        type: string
+        value: "info"

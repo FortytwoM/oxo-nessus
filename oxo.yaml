@@ -1,0 +1,71 @@
+kind: Agent
+name: nessus
+version: 0.1.0
+description: |
+  OXO Agent for Tenable Nessus vulnerability scanner integration.
+  Performs vulnerability scans using the Nessus API via pyTenable library.
+  Supports scanning IP addresses and domain names, reports discovered vulnerabilities.
+
+license: MIT
+source: https://github.com/FortyTwoM/oxo-nessus
+durability: development
+
+in_selectors:
+  - v3.asset.ip.v4
+  - v3.asset.ip.v6
+  - v3.asset.domain_name
+  - v3.asset.link
+
+out_selectors:
+  - v3.report.vulnerability
+
+restart_policy: on-failure
+
+args:
+  - name: "nessus_url"
+    type: "string"
+    description: "Nessus server URL (e.g., https://localhost:8834)"
+    value: "https://localhost:8834"
+
+  - name: "access_key"
+    type: "string"
+    description: "Nessus API access key"
+    value: ""
+
+  - name: "secret_key"
+    type: "string"
+    description: "Nessus API secret key"
+    value: ""
+
+  - name: "verify_ssl"
+    type: "boolean"
+    description: "Verify SSL certificate"
+    value: false
+
+  - name: "scan_policy_id"
+    type: "number"
+    description: "Nessus scan policy ID (optional, uses default if not specified)"
+    value: 0
+
+  - name: "scan_template"
+    type: "string"
+    description: "Nessus scan template name (e.g., 'basic', 'discovery', 'advanced')"
+    value: "basic"
+
+  - name: "wait_for_completion"
+    type: "boolean"
+    description: "Wait for scan to complete before reporting results"
+    value: true
+
+  - name: "timeout"
+    type: "number"
+    description: "Scan timeout in seconds (0 = no timeout)"
+    value: 3600
+
+  - name: "min_severity"
+    type: "string"
+    description: "Minimum severity level to report (info, low, medium, high, critical)"
+    value: "info"
+
+docker_file_path: Dockerfile
+docker_build_root: .
