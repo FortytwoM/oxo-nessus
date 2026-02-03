@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Ostorlab/oxo/main/images/oxo_logo.png" alt="OXO Logo" width="100"/>
-</p>
-
 # Agent Nessus
 
 <p align="center">
