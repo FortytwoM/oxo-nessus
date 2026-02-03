@@ -1,11 +1,59 @@
 """OXO Nessus Agent - Main agent implementation."""
 
+import sys
+from types import ModuleType
+
+def _make_exporter_stub(module_name: str, exporter_class_name: str = "SpanExporter"):
+    stub = ModuleType(module_name)
+    class NoOpExporter:
+        def __init__(self, *args, **kwargs): pass
+        def export(self, *args, **kwargs): pass
+        def shutdown(self, *args, **kwargs): pass
+        def force_flush(self, *args, **kwargs): return True
+    setattr(stub, exporter_class_name, NoOpExporter)
+    return stub
+
+_otel_exporter = __import__("opentelemetry.exporter", fromlist=[])
+_stub_names = [
+    ("cloud_trace", "CloudTraceSpanExporter"),
+    ("zipkin", "ZipkinSpanExporter"),
+    ("otlp", "OTLPSpanExporter"),
+]
+for name, class_name in _stub_names:
+    full_name = f"opentelemetry.exporter.{name}"
+    stub = _make_exporter_stub(full_name, class_name)
+    sys.modules[full_name] = stub
+    setattr(_otel_exporter, name, stub)
+
+def _ensure_jaeger_thrift():
+    try:
+        from opentelemetry.exporter.jaeger import thrift as _
+        return
+    except ImportError:
+        pass
+    jaeger_stub = ModuleType("opentelemetry.exporter.jaeger.thrift")
+    class _JaegerExporterStub:
+        def __init__(self, agent_name=None, host_name="localhost", port=6831, **kwargs):
+            pass
+        def export(self, span_data): return
+        def shutdown(self): pass
+        def force_flush(self, timeout_millis=None): return True
+    jaeger_stub.JaegerExporter = _JaegerExporterStub
+    sys.modules["opentelemetry.exporter.jaeger.thrift"] = jaeger_stub
+    parent = sys.modules.get("opentelemetry.exporter.jaeger", None)
+    if parent is None:
+        parent = ModuleType("opentelemetry.exporter.jaeger")
+        sys.modules["opentelemetry.exporter.jaeger"] = parent
+    setattr(parent, "thrift", jaeger_stub)
+_ensure_jaeger_thrift()
+
 import logging
 from typing import Optional
 from urllib.parse import urlparse
 
 from ostorlab.agent import agent
 from ostorlab.agent import definitions as agent_definitions
+from ostorlab.runtimes import definitions as runtime_definitions
 from ostorlab.agent.message import message as msg
 from ostorlab.agent.mixins import agent_report_vulnerability_mixin
 from ostorlab.agent.kb import kb
@@ -20,7 +68,6 @@ from agent.nessus_client import (
 logger = logging.getLogger(__name__)
 
 
-# Custom KB entry for Nessus findings
 NESSUS_KB_ENTRY = kb.Entry(
     title="Nessus Vulnerability Scan Finding",
     short_description="Vulnerability discovered by Tenable Nessus scanner",
@@ -37,6 +84,7 @@ NESSUS_KB_ENTRY = kb.Entry(
     targeted_by_malware=False,
     targeted_by_ransomware=False,
     targeted_by_nation_state=False,
+    risk_rating=agent_report_vulnerability_mixin.RiskRating.INFO,
 )
 
 
@@ -46,7 +94,7 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
     def __init__(
         self,
         agent_definition: agent_definitions.AgentDefinition,
-        agent_settings: agent_definitions.AgentSettings,
+        agent_settings: runtime_definitions.AgentSettings,
     ) -> None:
         """Initialize the Nessus agent."""
         super().__init__(agent_definition, agent_settings)
@@ -185,7 +233,7 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
                 references[cve] = f"https://nvd.nist.gov/vuln/detail/{cve}"
 
         if vuln.references:
-            for ref in vuln.references[:5]:  # Limit references
+            for ref in vuln.references[:5]:
                 if isinstance(ref, dict):
                     ref_type = ref.get("type", "Reference")
                     ref_id = ref.get("id", "")
@@ -193,6 +241,7 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
                 elif isinstance(ref, str):
                     references[ref] = ""
 
+        risk_rating = self._severity_to_risk_rating(vuln.severity)
         return kb.Entry(
             title=vuln.plugin_name or "Nessus Finding",
             short_description=vuln.synopsis or "Vulnerability detected by Nessus",
@@ -205,6 +254,7 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
             targeted_by_malware=False,
             targeted_by_ransomware=False,
             targeted_by_nation_state=False,
+            risk_rating=risk_rating,
         )
 
     def _build_technical_detail(self, vuln: Vulnerability) -> str:
@@ -264,7 +314,6 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
             logger.warning("Could not extract target from message: %s", message.selector)
             return
 
-        # Avoid scanning the same target multiple times
         if target in self._scanned_targets:
             logger.info("Target %s already scanned, skipping", target)
             return
@@ -275,7 +324,6 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
         try:
             client = self._get_client()
 
-            # Get template UUID
             template_uuid = None
             if self.scan_template:
                 template_uuid = client.get_template_uuid(self.scan_template)
@@ -284,7 +332,6 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
                         "Template '%s' not found, using default", self.scan_template
                     )
 
-            # Create scan
             scan_name = f"OXO Scan - {target}"
             policy_id = self.scan_policy_id if self.scan_policy_id > 0 else None
 
@@ -296,11 +343,9 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
                 description=f"Automated scan created by OXO Nessus Agent for target: {target}",
             )
 
-            # Launch scan
             client.launch_scan(scan_id)
             logger.info("Launched scan %s for target %s", scan_id, target)
 
-            # Wait for completion if configured
             if self.wait_for_completion:
                 logger.info("Waiting for scan %s to complete...", scan_id)
                 status = client.wait_for_scan(
@@ -310,7 +355,6 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
                 )
                 logger.info("Scan %s finished with status: %s", scan_id, status.value)
 
-            # Extract and report vulnerabilities
             vulnerabilities = client.get_vulnerabilities(
                 scan_id,
                 min_severity=self.min_severity,

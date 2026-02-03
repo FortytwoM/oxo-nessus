@@ -87,7 +87,20 @@ class NessusScanError(NessusClientError):
 
 
 class NessusClient:
-    """Client for interacting with Nessus API."""
+    """Client for interacting with Nessus API.
+
+    Scan management:
+        create_scan()      — create scan
+        launch_scan()      — launch scan
+        list_scans()       — list scans (by folder/date)
+        get_scan_status()  — scan status
+        wait_for_scan()    — wait for completion
+        pause_scan()       — pause
+        resume_scan()      — resume
+        stop_scan()        — stop
+        delete_scan()      — delete
+        get_scan_results() / get_vulnerabilities() — results
+    """
 
     def __init__(
         self,
@@ -122,7 +135,6 @@ class NessusClient:
                 secret_key=self.secret_key,
                 ssl_verify=self.verify_ssl,
             )
-            # Test connection by getting server info
             self._client.server.properties()
             logger.info("Successfully connected to Nessus server at %s", self.url)
         except Exception as e:
@@ -179,6 +191,20 @@ class NessusClient:
             logger.error("Failed to get policies: %s", str(e))
             raise NessusClientError(f"Failed to get policies: {e}") from e
 
+    def get_policy_uuid(self, policy_id: int) -> str:
+        """Get template UUID from a policy (for use in scan create).
+        As in NessusCLI: https://github.com/FortytwoM/NessusCLI
+        """
+        try:
+            policy = self.client.policies.details(policy_id)
+            uuid_val = policy.get("template_uuid") or policy.get("uuid") or policy.get("template")
+            if not uuid_val:
+                raise NessusScanError(f"Policy {policy_id} has no template UUID")
+            return uuid_val
+        except Exception as e:
+            logger.error("Failed to get policy UUID: %s", str(e))
+            raise NessusClientError(f"Failed to get policy UUID: {e}") from e
+
     def create_scan(
         self,
         name: str,
@@ -202,34 +228,36 @@ class NessusClient:
             Scan ID
         """
         try:
-            targets_str = ",".join(targets)
-            
-            scan_params = {
-                "name": name,
-                "text_targets": targets_str,
-            }
-            
-            if template_uuid:
-                scan_params["uuid"] = template_uuid
-            elif policy_id:
-                scan_params["policy_id"] = policy_id
-            else:
-                # Use basic network scan template by default
+            targets_str = ", ".join(targets) if isinstance(targets, list) else targets
+            uuid_to_use = template_uuid
+            if not uuid_to_use and policy_id:
+                uuid_to_use = self.get_policy_uuid(policy_id)
+            if not uuid_to_use:
                 basic_uuid = self.get_template_uuid("basic")
                 if basic_uuid:
-                    scan_params["uuid"] = basic_uuid
+                    uuid_to_use = basic_uuid
                 else:
-                    raise NessusScanError("No template or policy specified and default template not found")
-            
-            if folder_id:
-                scan_params["folder_id"] = folder_id
-                
+                    raise NessusScanError("UUID template is required (template_uuid or policy_id or 'basic' template)")
+
+            settings: Dict[str, Any] = {
+                "name": name,
+                "enabled": False,
+                "text_targets": targets_str,
+            }
             if description:
-                scan_params["description"] = description
-                
-            scan = self.client.scans.create(**scan_params)
-            scan_id = scan.get("id")
-            logger.info("Created scan '%s' with ID %s", name, scan_id)
+                settings["description"] = description
+            if folder_id is not None:
+                settings["folder_id"] = folder_id
+
+            scan = self.client.scans.create(uuid=uuid_to_use, settings=settings)
+            scan_obj = scan.get("scan") if isinstance(scan.get("scan"), dict) else scan
+            scan_id = scan_obj.get("id")
+            if scan_id is None:
+                raise NessusScanError(f"Create scan response has no id: {list(scan.keys())}")
+            scan_id = int(scan_id)
+            logger.info(
+                "Created scan in Nessus: name='%s', id=%s (check Nessus UI: Scans)", name, scan_id
+            )
             return scan_id
             
         except Exception as e:
@@ -245,14 +273,34 @@ class NessusClient:
         Returns:
             Scan UUID
         """
-        try:
-            result = self.client.scans.launch(scan_id)
-            scan_uuid = result.get("scan_uuid")
-            logger.info("Launched scan %s, UUID: %s", scan_id, scan_uuid)
-            return scan_uuid
-        except Exception as e:
-            logger.error("Failed to launch scan %s: %s", scan_id, str(e))
-            raise NessusScanError(f"Failed to launch scan: {e}") from e
+        scan_id = int(scan_id)
+        last_error = None
+        for attempt in range(3):
+            try:
+                result = self.client.scans.launch(scan_id)
+                scan_uuid = result if isinstance(result, str) else (result.get("scan_uuid") or "")
+                logger.info("Launched scan %s, UUID: %s", scan_id, scan_uuid)
+                return scan_uuid
+            except Exception as e:
+                last_error = e
+                is_conn = "Connection" in type(e).__name__ or "RemoteDisconnected" in str(e)
+                if is_conn and attempt < 2:
+                    wait = 2 * (attempt + 1)
+                    logger.warning(
+                        "Launch scan %s attempt %s failed (connection): %s; retry in %ss",
+                        scan_id, attempt + 1, str(e), wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.error("Failed to launch scan %s: %s", scan_id, str(e))
+                msg = str(e)
+                if is_conn:
+                    msg = (
+                        f"{msg}. Check that Nessus URL is reachable from this host, "
+                        "SSL verification (verify_ssl), and firewall."
+                    )
+                raise NessusScanError(f"Failed to launch scan: {msg}") from e
+        raise NessusScanError(f"Failed to launch scan: {last_error}") from last_error
 
     def get_scan_status(self, scan_id: int) -> ScanStatus:
         """Get scan status.
@@ -341,7 +389,6 @@ class NessusClient:
                 host_id = host.get("host_id")
                 host_name = host.get("hostname", "unknown")
                 
-                # Get host details with vulnerabilities
                 try:
                     host_details = self.client.scans.host_details(scan_id, host_id)
                 except Exception as e:
@@ -356,7 +403,6 @@ class NessusClient:
                     
                     plugin_id = vuln.get("plugin_id")
                     
-                    # Get detailed plugin information
                     try:
                         plugin_output = self.client.scans.plugin_output(
                             scan_id, host_id, plugin_id
@@ -392,6 +438,56 @@ class NessusClient:
             raise NessusScanError(f"Failed to extract vulnerabilities: {e}") from e
             
         return vulnerabilities
+
+    def list_scans(
+        self,
+        folder_id: Optional[int] = None,
+        last_modification_date: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """List scans.
+        
+        Args:
+            folder_id: Filter by folder ID
+            last_modification_date: Only scans modified after this Unix timestamp
+            
+        Returns:
+            API response with 'scans' list
+        """
+        try:
+            result = self.client.scans.list(
+                folder_id=folder_id,
+                last_modification_date=last_modification_date,
+            )
+            return result if isinstance(result, dict) else {"scans": list(result)}
+        except Exception as e:
+            logger.error("Failed to list scans: %s", str(e))
+            raise NessusScanError(f"Failed to list scans: {e}") from e
+
+    def pause_scan(self, scan_id: int) -> None:
+        """Pause a running scan.
+        
+        Args:
+            scan_id: Scan ID to pause
+        """
+        try:
+            self.client.scans.pause(scan_id)
+            logger.info("Paused scan %s", scan_id)
+        except Exception as e:
+            logger.error("Failed to pause scan %s: %s", scan_id, str(e))
+            raise NessusScanError(f"Failed to pause scan: {e}") from e
+
+    def resume_scan(self, scan_id: int) -> None:
+        """Resume a paused scan.
+        
+        Args:
+            scan_id: Scan ID to resume
+        """
+        try:
+            self.client.scans.resume(scan_id)
+            logger.info("Resumed scan %s", scan_id)
+        except Exception as e:
+            logger.error("Failed to resume scan %s: %s", scan_id, str(e))
+            raise NessusScanError(f"Failed to resume scan: {e}") from e
 
     def delete_scan(self, scan_id: int) -> None:
         """Delete a scan.

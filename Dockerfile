@@ -1,16 +1,14 @@
-FROM python:3.11-alpine as base
+FROM python:3.11-slim
 
-FROM base as builder
-RUN mkdir /install
-WORKDIR /install
-COPY requirements.txt /requirements.txt
-RUN pip install --prefix=/install -r /requirements.txt
-
-FROM base
-COPY --from=builder /install /usr/local
 RUN mkdir -p /app/agent
+WORKDIR /app
 ENV PYTHONPATH=/app
+
+COPY requirements.txt /requirements.txt
+RUN pip install --no-cache-dir -r /requirements.txt
+
 COPY agent /app/agent
 COPY oxo.yaml /app/agent/oxo.yaml
+
 WORKDIR /app
 CMD ["python3", "/app/agent/nessus_agent.py"]

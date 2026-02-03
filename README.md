@@ -245,6 +245,10 @@ oxo scan run --install -g agent_group.yaml ip 192.168.1.1
 
 [MIT](LICENSE)
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
+
 ## References
 
 - [OXO Documentation](https://oxo.ostorlab.co/docs)
