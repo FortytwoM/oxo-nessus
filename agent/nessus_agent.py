@@ -1,7 +1,12 @@
-"""OXO Nessus Agent - Main agent implementation."""
+"""OXO Nessus Agent - Main agent implementation.
+
+Processes v3.asset (ip, domain_name, link) and reports v3.report.vulnerability
+via Nessus API (pyTenable). See OXO docs: https://oxo.ostorlab.co/docs
+"""
 
 import sys
 from types import ModuleType
+
 
 def _make_exporter_stub(module_name: str, exporter_class_name: str = "SpanExporter"):
     stub = ModuleType(module_name)
@@ -48,6 +53,7 @@ def _ensure_jaeger_thrift():
 _ensure_jaeger_thrift()
 
 import logging
+import time
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -57,15 +63,28 @@ from ostorlab.runtimes import definitions as runtime_definitions
 from ostorlab.agent.message import message as msg
 from ostorlab.agent.mixins import agent_report_vulnerability_mixin
 from ostorlab.agent.kb import kb
+from ostorlab.assets import domain_name as asset_domain_name
+from ostorlab.assets import ipv4 as asset_ipv4
+from ostorlab.assets import ipv6 as asset_ipv6
+from ostorlab.assets import link as asset_link
 
 from agent.nessus_client import (
     NessusClient,
     NessusClientError,
+    ScanStatus,
     Severity,
     Vulnerability,
 )
 
 logger = logging.getLogger(__name__)
+
+# OXO asset selectors (oxo.yaml in_selectors)
+SELECTOR_DOMAIN_NAME = "v3.asset.domain_name"
+SELECTOR_IP_V4 = "v3.asset.ip.v4"
+SELECTOR_IP_V6 = "v3.asset.ip.v6"
+SELECTOR_LINK = "v3.asset.link"
+DEFAULT_SCAN_TEMPLATE = "basic"
+DEFAULT_MIN_SEVERITY = "info"
 
 
 NESSUS_KB_ENTRY = kb.Entry(
@@ -123,13 +142,19 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
 
     @property
     def scan_policy_id(self) -> int:
-        """Get scan policy ID."""
-        return self.args.get("scan_policy_id", 0)
+        """Get scan policy ID (0 = use template, not policy)."""
+        raw = self.args.get("scan_policy_id", 0)
+        if raw is None:
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
 
     @property
     def scan_template(self) -> str:
-        """Get scan template name."""
-        return self.args.get("scan_template", "basic")
+        """Get scan template name (used when scan_policy_id is 0)."""
+        return self.args.get("scan_template", DEFAULT_SCAN_TEMPLATE)
 
     @property
     def wait_for_completion(self) -> bool:
@@ -143,8 +168,8 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
 
     @property
     def min_severity(self) -> Severity:
-        """Get minimum severity level."""
-        severity_str = self.args.get("min_severity", "info")
+        """Get minimum severity level for reported vulnerabilities."""
+        severity_str = self.args.get("min_severity", DEFAULT_MIN_SEVERITY)
         return Severity.from_string(severity_str)
 
     def _get_client(self) -> NessusClient:
@@ -168,34 +193,18 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
         return self._client
 
     def _extract_target(self, message: msg.Message) -> Optional[str]:
-        """Extract target from message based on selector type.
-        
-        Args:
-            message: Input message
-            
-        Returns:
-            Target string (IP or hostname) or None
-        """
+        """Extract target (IP or hostname) from message based on selector."""
         selector = message.selector
-
-        if selector == "v3.asset.ip.v4":
-            host = message.data.get("host")
-            return host
-
-        elif selector == "v3.asset.ip.v6":
-            host = message.data.get("host")
-            return host
-
-        elif selector == "v3.asset.domain_name":
-            name = message.data.get("name")
-            return name
-
-        elif selector == "v3.asset.link":
-            url = message.data.get("url")
+        data = message.data or {}
+        if selector == SELECTOR_IP_V4 or selector == SELECTOR_IP_V6:
+            return data.get("host")
+        if selector == SELECTOR_DOMAIN_NAME:
+            return data.get("name")
+        if selector == SELECTOR_LINK:
+            url = data.get("url")
             if url:
                 parsed = urlparse(url)
                 return parsed.hostname
-
         return None
 
     def _severity_to_risk_rating(
@@ -286,20 +295,51 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
 
         return "\n".join(details)
 
-    def _report_vulnerability(self, vuln: Vulnerability) -> None:
-        """Report a vulnerability finding.
-        
-        Args:
-            vuln: Vulnerability object
-        """
+    def _build_vulnerability_location(
+        self, message: msg.Message, vuln: Vulnerability
+    ) -> Optional[agent_report_vulnerability_mixin.VulnerabilityLocation]:
+        """Build vulnerability location so OXO links the finding to the scanned asset."""
+        mixin = agent_report_vulnerability_mixin
+        data = message.data or {}
+        selector = message.selector
+        asset = None
+        if selector == SELECTOR_DOMAIN_NAME and data.get("name"):
+            asset = asset_domain_name.DomainName(name=data["name"])
+        elif selector == SELECTOR_IP_V4 and data.get("host"):
+            asset = asset_ipv4.IPv4(host=data["host"])
+        elif selector == SELECTOR_IP_V6 and data.get("host"):
+            asset = asset_ipv6.IPv6(host=data["host"])
+        elif selector == SELECTOR_LINK and data.get("url"):
+            asset = asset_link.Link(url=data["url"])
+        if asset is None:
+            return None
+        meta = [
+            mixin.VulnerabilityLocationMetadata(
+                metadata_type=mixin.MetadataType.PORT, value=str(vuln.port)
+            ),
+        ]
+        return mixin.VulnerabilityLocation(metadata=meta, asset=asset)
+
+    def _report_vulnerability(
+        self, vuln: Vulnerability, message: msg.Message
+    ) -> None:
+        """Report a vulnerability finding with location and stable dna for OXO."""
+        target = self._extract_target(message) or "unknown"
         kb_entry = self._create_kb_entry(vuln)
         risk_rating = self._severity_to_risk_rating(vuln.severity)
         technical_detail = self._build_technical_detail(vuln)
+        vulnerability_location = self._build_vulnerability_location(message, vuln)
+        dna = f"nessus:{target}:{vuln.host}:{vuln.port}:{vuln.plugin_id}"
 
         self.report_vulnerability(
             entry=kb_entry,
             technical_detail=technical_detail,
             risk_rating=risk_rating,
+            dna=dna,
+            vulnerability_location=vulnerability_location,
+        )
+        logger.debug(
+            "Reported vuln to OXO: %s (%s)", vuln.plugin_name, dna
         )
 
     def process(self, message: msg.Message) -> None:
@@ -324,17 +364,20 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
         try:
             client = self._get_client()
 
+            policy_id = self.scan_policy_id if self.scan_policy_id > 0 else None
             template_uuid = None
-            if self.scan_template:
+            if not policy_id and self.scan_template:
                 template_uuid = client.get_template_uuid(self.scan_template)
                 if not template_uuid:
                     logger.warning(
                         "Template '%s' not found, using default", self.scan_template
                     )
+            if policy_id:
+                logger.info("Using Nessus policy_id=%s for scan", policy_id)
+            else:
+                logger.info("Using template for scan (template_uuid=%s)", template_uuid or "basic fallback")
 
             scan_name = f"OXO Scan - {target}"
-            policy_id = self.scan_policy_id if self.scan_policy_id > 0 else None
-
             scan_id = client.create_scan(
                 name=scan_name,
                 targets=[target],
@@ -346,26 +389,64 @@ class NessusAgent(agent.Agent, agent_report_vulnerability_mixin.AgentReportVulnM
             client.launch_scan(scan_id)
             logger.info("Launched scan %s for target %s", scan_id, target)
 
+            reported_keys: set = set()
+            poll_interval = 30
+
             if self.wait_for_completion:
-                logger.info("Waiting for scan %s to complete...", scan_id)
-                status = client.wait_for_scan(
+                logger.info(
+                    "Waiting for scan %s to complete (reporting vulns as they appear)...",
                     scan_id,
-                    timeout=self.timeout,
-                    poll_interval=30,
                 )
-                logger.info("Scan %s finished with status: %s", scan_id, status.value)
+                start_time = time.time()
+                while True:
+                    status = client.get_scan_status(scan_id)
+                    vulns = client.get_vulnerabilities(
+                        scan_id, min_severity=self.min_severity
+                    )
+                    if vulns and len(reported_keys) == 0:
+                        logger.info(
+                            "Scan %s: Nessus returned %d vulnerability findings",
+                            scan_id,
+                            len(vulns),
+                        )
+                    new_count = 0
+                    for vuln in vulns:
+                        key = (vuln.host, vuln.port, vuln.plugin_id)
+                        if key not in reported_keys:
+                            reported_keys.add(key)
+                            self._report_vulnerability(vuln, message)
+                            new_count += 1
+                    if new_count:
+                        logger.info(
+                            "Scan %s: reported %d new vulnerabilities (%d total so far)",
+                            scan_id,
+                            new_count,
+                            len(reported_keys),
+                        )
+                    if status in (ScanStatus.COMPLETED, ScanStatus.CANCELED):
+                        logger.info(
+                            "Scan %s finished with status: %s", scan_id, status.value
+                        )
+                        break
+                    if self.timeout > 0 and (
+                        time.time() - start_time
+                    ) >= self.timeout:
+                        logger.warning(
+                            "Scan %s timed out after %s seconds", scan_id, self.timeout
+                        )
+                        break
+                    time.sleep(poll_interval)
+            else:
+                vulns = client.get_vulnerabilities(
+                    scan_id, min_severity=self.min_severity
+                )
+                for vuln in vulns:
+                    self._report_vulnerability(vuln, message)
 
-            vulnerabilities = client.get_vulnerabilities(
-                scan_id,
-                min_severity=self.min_severity,
-            )
-
+            total = len(reported_keys) if self.wait_for_completion else len(vulns)
             logger.info(
-                "Found %d vulnerabilities for target %s", len(vulnerabilities), target
+                "Found %d vulnerabilities for target %s", total, target
             )
-
-            for vuln in vulnerabilities:
-                self._report_vulnerability(vuln)
 
         except NessusClientError as e:
             logger.error("Nessus client error: %s", str(e))

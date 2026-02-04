@@ -1,4 +1,8 @@
-"""Nessus API client wrapper using pyTenable library."""
+"""Nessus API client wrapper using pyTenable library.
+
+Uses pyTenable Nessus API: scans, policies, editor (templates).
+See: https://pytenable.readthedocs.io/en/stable/api/nessus/
+"""
 
 import logging
 import time
@@ -9,6 +13,10 @@ from enum import Enum
 from tenable.nessus import Nessus
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TEMPLATE = "basic"
+LAUNCH_RETRIES = 3
+LAUNCH_RETRY_BACKOFF_SEC = 2
 
 
 class ScanStatus(Enum):
@@ -193,14 +201,21 @@ class NessusClient:
 
     def get_policy_uuid(self, policy_id: int) -> str:
         """Get template UUID from a policy (for use in scan create).
-        As in NessusCLI: https://github.com/FortytwoM/NessusCLI
+
+        Nessus API: GET /policies/{id}. Policy must exist; 404 if not found.
         """
         try:
             policy = self.client.policies.details(policy_id)
-            uuid_val = policy.get("template_uuid") or policy.get("uuid") or policy.get("template")
+            uuid_val = (
+                policy.get("template_uuid")
+                or policy.get("uuid")
+                or policy.get("template")
+            )
             if not uuid_val:
                 raise NessusScanError(f"Policy {policy_id} has no template UUID")
             return uuid_val
+        except NessusClientError:
+            raise
         except Exception as e:
             logger.error("Failed to get policy UUID: %s", str(e))
             raise NessusClientError(f"Failed to get policy UUID: {e}") from e
@@ -230,14 +245,30 @@ class NessusClient:
         try:
             targets_str = ", ".join(targets) if isinstance(targets, list) else targets
             uuid_to_use = template_uuid
+            policy_id_to_use: Optional[int] = None
             if not uuid_to_use and policy_id:
-                uuid_to_use = self.get_policy_uuid(policy_id)
+                try:
+                    uuid_to_use = self.get_policy_uuid(policy_id)
+                    policy_id_to_use = policy_id
+                except NessusClientError as e:
+                    err_msg = str(e).lower()
+                    if "404" in err_msg or "not found" in err_msg:
+                        logger.warning(
+                            "Policy %s not found on Nessus server (404), using template 'basic' instead. "
+                            "Check policy ID in Nessus UI (Policies) or omit scan_policy_id.",
+                            policy_id,
+                        )
+                        uuid_to_use = self.get_template_uuid(DEFAULT_TEMPLATE)
+                    else:
+                        raise
             if not uuid_to_use:
-                basic_uuid = self.get_template_uuid("basic")
+                basic_uuid = self.get_template_uuid(DEFAULT_TEMPLATE)
                 if basic_uuid:
                     uuid_to_use = basic_uuid
                 else:
-                    raise NessusScanError("UUID template is required (template_uuid or policy_id or 'basic' template)")
+                    raise NessusScanError(
+                        f"UUID template is required (template_uuid or policy_id or '{DEFAULT_TEMPLATE}' template)"
+                    )
 
             settings: Dict[str, Any] = {
                 "name": name,
@@ -248,8 +279,11 @@ class NessusClient:
                 settings["description"] = description
             if folder_id is not None:
                 settings["folder_id"] = folder_id
+            if policy_id_to_use is not None:
+                settings["policy_id"] = int(policy_id_to_use)
 
-            scan = self.client.scans.create(uuid=uuid_to_use, settings=settings)
+            create_kwargs: Dict[str, Any] = {"uuid": uuid_to_use, "settings": settings}
+            scan = self.client.scans.create(**create_kwargs)
             scan_obj = scan.get("scan") if isinstance(scan.get("scan"), dict) else scan
             scan_id = scan_obj.get("id")
             if scan_id is None:
@@ -260,6 +294,10 @@ class NessusClient:
             )
             return scan_id
             
+        except NessusScanError:
+            raise
+        except NessusClientError:
+            raise
         except Exception as e:
             logger.error("Failed to create scan: %s", str(e))
             raise NessusScanError(f"Failed to create scan: {e}") from e
@@ -274,21 +312,31 @@ class NessusClient:
             Scan UUID
         """
         scan_id = int(scan_id)
-        last_error = None
-        for attempt in range(3):
+        last_error: Optional[Exception] = None
+        for attempt in range(LAUNCH_RETRIES):
             try:
                 result = self.client.scans.launch(scan_id)
-                scan_uuid = result if isinstance(result, str) else (result.get("scan_uuid") or "")
+                scan_uuid = (
+                    result
+                    if isinstance(result, str)
+                    else (result.get("scan_uuid") or "")
+                )
                 logger.info("Launched scan %s, UUID: %s", scan_id, scan_uuid)
                 return scan_uuid
             except Exception as e:
                 last_error = e
-                is_conn = "Connection" in type(e).__name__ or "RemoteDisconnected" in str(e)
-                if is_conn and attempt < 2:
-                    wait = 2 * (attempt + 1)
+                is_conn = (
+                    "Connection" in type(e).__name__
+                    or "RemoteDisconnected" in str(e)
+                )
+                if is_conn and attempt < LAUNCH_RETRIES - 1:
+                    wait = LAUNCH_RETRY_BACKOFF_SEC * (attempt + 1)
                     logger.warning(
                         "Launch scan %s attempt %s failed (connection): %s; retry in %ss",
-                        scan_id, attempt + 1, str(e), wait,
+                        scan_id,
+                        attempt + 1,
+                        str(e),
+                        wait,
                     )
                     time.sleep(wait)
                     continue
@@ -296,11 +344,13 @@ class NessusClient:
                 msg = str(e)
                 if is_conn:
                     msg = (
-                        f"{msg}. Check that Nessus URL is reachable from this host, "
-                        "SSL verification (verify_ssl), and firewall."
+                        f"{msg}. Check Nessus URL reachability, "
+                        "verify_ssl, and firewall."
                     )
                 raise NessusScanError(f"Failed to launch scan: {msg}") from e
-        raise NessusScanError(f"Failed to launch scan: {last_error}") from last_error
+        raise NessusScanError(
+            f"Failed to launch scan: {last_error}"
+        ) from last_error
 
     def get_scan_status(self, scan_id: int) -> ScanStatus:
         """Get scan status.
@@ -403,16 +453,28 @@ class NessusClient:
                     
                     plugin_id = vuln.get("plugin_id")
                     
+                    plugin_output_data: Optional[str] = None
+                    plugin_attrs: Dict[str, Any] = {}
                     try:
-                        plugin_output = self.client.scans.plugin_output(
+                        po_resp = self.client.scans.plugin_output(
                             scan_id, host_id, plugin_id
                         )
-                        plugin_info = plugin_output.get("info", {}).get("plugindescription", {})
+                        plugin_info = (po_resp or {}).get("info", {}).get(
+                            "plugindescription", {}
+                        )
                         plugin_attrs = plugin_info.get("pluginattributes", {})
-                    except Exception:
-                        plugin_info = {}
-                        plugin_attrs = {}
-                    
+                        plugin_output_data = (po_resp or {}).get("output")
+                    except Exception as e:
+                        logger.debug(
+                            "Plugin output for %s/%s/%s: %s",
+                            scan_id,
+                            host_id,
+                            plugin_id,
+                            e,
+                        )
+
+                    risk_info = plugin_attrs.get("risk_information", {})
+                    ref_info = plugin_attrs.get("ref_information", {})
                     vulnerability = Vulnerability(
                         plugin_id=plugin_id,
                         plugin_name=vuln.get("plugin_name", ""),
@@ -424,12 +486,12 @@ class NessusClient:
                         description=plugin_attrs.get("description", ""),
                         solution=plugin_attrs.get("solution", ""),
                         synopsis=plugin_attrs.get("synopsis", ""),
-                        risk_factor=plugin_attrs.get("risk_information", {}).get("risk_factor", ""),
-                        cvss_base_score=plugin_attrs.get("risk_information", {}).get("cvss_base_score"),
-                        cvss3_base_score=plugin_attrs.get("risk_information", {}).get("cvss3_base_score"),
-                        cve=plugin_attrs.get("ref_information", {}).get("cve", []),
-                        references=plugin_attrs.get("ref_information", {}).get("xref", []),
-                        plugin_output=plugin_output.get("output"),
+                        risk_factor=risk_info.get("risk_factor", ""),
+                        cvss_base_score=risk_info.get("cvss_base_score"),
+                        cvss3_base_score=risk_info.get("cvss3_base_score"),
+                        cve=ref_info.get("cve", []),
+                        references=ref_info.get("xref", []),
+                        plugin_output=plugin_output_data,
                     )
                     vulnerabilities.append(vulnerability)
                     
